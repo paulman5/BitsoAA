@@ -10,10 +10,11 @@ export const useSmartAccount = () => {
       const data = await res.json()
       console.log("data", data)
       setAccountAddress(data.address)
+      setKernelClient(data.kernelClient)
     }
 
     fetchAccount()
   }, [])
 
-  return { accountAddress }
+  return { accountAddress, kernelClient }
 }

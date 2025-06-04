@@ -1,3 +1,4 @@
+// app/swap/page.tsx
 "use client"
 
 import { useState, useEffect } from "react"
@@ -13,28 +14,23 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
-import { Slider } from "@/components/ui/slider"
 import {
   ArrowUpDown,
   Copy,
   ExternalLink,
   RefreshCw,
-  Clock,
   CheckCircle,
   Loader2,
 } from "lucide-react"
-import {
-  useDynamicContext,
-  useTokenBalances,
-} from "@dynamic-labs/sdk-react-core"
+import { useDynamicContext } from "@dynamic-labs/sdk-react-core"
 import { useSmartAccount } from "@/hooks/useSmartaccount"
 import { ethers } from "ethers"
-import mockUsdcAbi from "@/abi/mockusdc.json"
-import { useUserWallets } from "@dynamic-labs/sdk-react-core"
 import erc20Abi from "@/abi/erc20.json"
 import { formatUnits, parseUnits, encodeFunctionData } from "viem"
 import type { Abi } from "viem"
 import mockSwapAbi from "@/abi/mockswap.json"
+import { createPublicClient, http } from "viem"
+import { sepolia } from "viem/chains"
 
 const tokens: {
   address: `0x${string}`
@@ -43,68 +39,64 @@ const tokens: {
   formatted?: string
 }[] = [
   {
-    address: "0x6c6Dc940F2E6a27921df887AD96AE586abD8EfD8",
+    address: "0x6c6Dc940F2E6a27921df887AD96AE586abD8EfD8", // mUSDC
     symbol: "USDC",
     icon: "💵",
   },
   {
-    address: "0x2eC77FDcb56370A3C0aDa518DDe86D820d76743B",
+    address: "0x2eC77FDcb56370A3C0aDa518DDe86D820d76743B", // mPEPE
     symbol: "PEPE",
     icon: "🐸",
   },
 ]
 
-const transactions = [
-  {
-    id: "0x1a2b3c...",
-    type: "Swap",
-    from: "PEPE",
-    to: "USDC",
-    amount: "100,000",
-    status: "success",
-    timestamp: "2 min ago",
-    gasSponsored: true,
-  },
-  {
-    id: "0x4d5e6f...",
-    type: "Approve",
-    from: "WETH",
-    to: "",
-    amount: "1.0",
-    status: "pending",
-    timestamp: "5 min ago",
-    gasSponsored: true,
-  },
-]
-
-// Add your deployed MockSwap contract address here:
+// Your deployed MockSwap on Sepolia:
 const MOCK_SWAP_ADDRESS =
   "0x718421BB9a6Bb63D4A63295d59c12196c3e221Ed" as `0x${string}`
+
+const publicClient = createPublicClient({
+  chain: sepolia,
+  transport: http(),
+})
+
+const pollForAllowance = async (
+  owner: `0x${string}`,
+  spender: `0x${string}`,
+  expectedAmount: bigint,
+  tokenAddress: `0x${string}`,
+  maxTries = 20
+): Promise<boolean> => {
+  for (let i = 0; i < maxTries; i++) {
+    const allowance = await publicClient.readContract({
+      address: tokenAddress,
+      abi: erc20Abi as Abi,
+      functionName: "allowance",
+      args: [owner, spender],
+    })
+    if (BigInt(allowance as string) >= expectedAmount) {
+      return true
+    }
+    // Wait 2 seconds before retry
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+  }
+  return false
+}
 
 export default function TokenSwapDApp() {
   const [fromToken, setFromToken] = useState(tokens[0])
   const [toToken, setToToken] = useState(tokens[1])
-
   const [fromAmount, setFromAmount] = useState("")
   const [toAmount, setToAmount] = useState("")
   const [isConnected, setIsConnected] = useState(false)
-  const [smartAccount, setSmartAccount] = useState("")
   const [isSwapping, setIsSwapping] = useState(false)
-  const [slippage, setSlippage] = useState([0.5])
-  const [expiry, setExpiry] = useState([5])
   const [swapStatus, setSwapStatus] = useState<
     null | "pending" | "success" | "error"
   >(null)
 
   const { primaryWallet } = useDynamicContext()
-
   const { accountAddress } = useSmartAccount()
 
-  const tokenAddressMap: Record<string, `0x${string}`> = {
-    mUSDC: "0x6c6Dc940F2E6a27921df887AD96AE586abD8EfD8",
-    mPEPE: "0x2eC77FDcb56370A3C0aDa518DDe86D820d76743B",
-  }
-
+  // Fetch balances & decimals via wagmi:
   const { data, isLoading } = useReadContracts({
     contracts: tokens.flatMap((token) => [
       {
@@ -138,36 +130,37 @@ export default function TokenSwapDApp() {
     }
   })
 
-  const handleSwapTokens = () => {
-    const tempToken = fromToken
-    setFromToken(toToken)
-    setToToken(tempToken)
-    setFromAmount(toAmount)
-    setToAmount(fromAmount)
-  }
+  useEffect(() => {
+    if (primaryWallet) {
+      setIsConnected(true)
+    }
+  }, [primaryWallet])
 
   const handleSwap = async () => {
-    if (!fromAmount || !accountAddress) return
+    if (!fromAmount || !accountAddress) {
+      return
+    }
+
     setIsSwapping(true)
     setSwapStatus("pending")
 
     try {
-      // Get decimals for the fromToken
+      // 1) Get decimals & parse the "fromAmount" to BigInt:
       const decimals = Number(
         data?.[
           tokens.findIndex((t) => t.symbol === fromToken.symbol) * 2 + 1
         ] ?? 18
       )
-      const amount = parseUnits(fromAmount, decimals)
+      const amountBigInt = parseUnits(fromAmount, decimals)
 
-      // 1. Encode approve call
+      // 2) Encode the ERC20.approve(...) call to let MockSwap pull tokens:
       const approveData = encodeFunctionData({
         abi: erc20Abi as Abi,
         functionName: "approve",
-        args: [MOCK_SWAP_ADDRESS, amount],
+        args: [MOCK_SWAP_ADDRESS, amountBigInt],
       })
 
-      // 2. Send approve as a single user operation
+      // 3) Send the approve UserOp:
       const approveRes = await fetch("/api/smartaccount", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -181,19 +174,31 @@ export default function TokenSwapDApp() {
         }),
       })
       const approveJson = await approveRes.json()
-      if (!approveRes.ok) throw new Error(approveJson.error || "Approve failed")
+      if (!approveRes.ok) {
+        throw new Error(approveJson.error || "Approve step failed")
+      }
+      // At this point, /api/smartaccount waited until the approve UserOp was mined
+      // (because we added `await client.waitForUserOperationReceipt(...)` in the API).
 
-      // 3. Wait for allowance to be updated (simple delay; replace with polling for production)
-      await new Promise((resolve) => setTimeout(resolve, 10000)) // 10 seconds
+      // 4) Poll on-chain until the allowance is actually ≥ amountBigInt
+      const allowanceOk = await pollForAllowance(
+        accountAddress as `0x${string}`,
+        MOCK_SWAP_ADDRESS,
+        amountBigInt,
+        fromToken.address
+      )
+      if (!allowanceOk) {
+        throw new Error("Allowance did not update in time.")
+      }
 
-      // 4. Encode swapAToB call
+      // 5) Now that allowance is on-chain, encode swapAToB(amountBigInt):
       const swapData = encodeFunctionData({
         abi: mockSwapAbi.abi,
         functionName: "swapAToB",
-        args: [amount],
+        args: [amountBigInt],
       })
 
-      // 5. Send swap as a single user operation
+      // 6) Send the swap UserOp:
       const swapRes = await fetch("/api/smartaccount", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -207,31 +212,22 @@ export default function TokenSwapDApp() {
         }),
       })
       const swapJson = await swapRes.json()
-      if (!swapRes.ok) throw new Error(swapJson.error || "Swap failed")
+      if (!swapRes.ok) {
+        throw new Error(swapJson.error || "Swap step failed")
+      }
 
+      // The API again will not return until that swap UserOp is mined (because of waitForUserOperationReceipt).
       setSwapStatus("success")
-    } catch (e) {
-      console.error("Swap error:", e)
+    } catch (err: any) {
+      console.error("Swap error:", err)
       setSwapStatus("error")
     } finally {
       setIsSwapping(false)
     }
   }
 
-  useEffect(() => {
-    if (primaryWallet) {
-      setIsConnected(true)
-    }
-  }, [primaryWallet])
-
-  const copyAddress = () => {
-    navigator.clipboard.writeText(smartAccount)
-  }
-
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-100">
-      {/* Header */}
-
       <div className="container mx-auto px-4 py-8">
         <div className="grid lg:grid-cols-3 gap-8 max-w-7xl mx-auto">
           {/* Main Swap Interface */}
@@ -253,11 +249,8 @@ export default function TokenSwapDApp() {
                   <div className="flex items-center gap-2 text-sm text-gray-600">
                     <span>Smart Account: {accountAddress}</span>
                     <code className="bg-gray-100 rounded text-xs">
-                      {smartAccount}
+                      {accountAddress}
                     </code>
-                    <Button variant="ghost" size="sm" onClick={copyAddress}>
-                      <Copy className="w-3 h-3" />
-                    </Button>
                   </div>
                 )}
               </CardHeader>
@@ -319,7 +312,13 @@ export default function TokenSwapDApp() {
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={handleSwapTokens}
+                    onClick={() => {
+                      const temp = fromToken
+                      setFromToken(toToken)
+                      setToToken(temp)
+                      setFromAmount(toAmount)
+                      setToAmount(fromAmount)
+                    }}
                     className="rounded-full w-10 h-10 p-0 border-2 bg-white hover:bg-gray-50"
                   >
                     <ArrowUpDown className="w-4 h-4" />
@@ -377,55 +376,6 @@ export default function TokenSwapDApp() {
                   </div>
                 </div>
 
-                {/* Swap Settings */}
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-700">
-                      Slippage Tolerance
-                    </label>
-                    <div className="bg-gray-50 rounded-lg p-3">
-                      <div className="flex items-center justify-between mb-2">
-                        <span className="text-sm text-gray-600">
-                          Max Slippage
-                        </span>
-                        <span className="text-sm font-medium">
-                          {slippage[0]}%
-                        </span>
-                      </div>
-                      <Slider
-                        value={slippage}
-                        onValueChange={setSlippage}
-                        max={5}
-                        min={0.1}
-                        step={0.1}
-                        className="w-full"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-700">
-                      Transaction Expiry
-                    </label>
-                    <div className="bg-gray-50 rounded-lg p-3">
-                      <div className="flex items-center justify-between mb-2">
-                        <Clock className="w-4 h-4 text-gray-500" />
-                        <span className="text-sm font-medium">
-                          {expiry[0]} min
-                        </span>
-                      </div>
-                      <Slider
-                        value={expiry}
-                        onValueChange={setExpiry}
-                        max={30}
-                        min={1}
-                        step={1}
-                        className="w-full"
-                      />
-                    </div>
-                  </div>
-                </div>
-
                 {/* Swap Button */}
                 <Button
                   onClick={handleSwap}
@@ -466,9 +416,8 @@ export default function TokenSwapDApp() {
             </Card>
           </div>
 
-          {/* Transaction History & Account Info */}
+          {/* Sidebar (Balances & History) */}
           <div className="space-y-6">
-            {/* Account Balance */}
             {isConnected && (
               <Card className="border-0 shadow-lg bg-white/90 backdrop-blur-sm">
                 <CardHeader className="pb-3">
@@ -507,7 +456,6 @@ export default function TokenSwapDApp() {
               </Card>
             )}
 
-            {/* Transaction History */}
             <Card className="border-0 shadow-lg bg-white/90 backdrop-blur-sm">
               <CardHeader className="pb-3">
                 <div className="flex items-center justify-between">
@@ -518,54 +466,9 @@ export default function TokenSwapDApp() {
                 </div>
               </CardHeader>
               <CardContent className="space-y-3">
-                {transactions.length === 0 ? (
-                  <div className="text-center py-8 text-gray-500">
-                    <div className="text-sm">No transactions yet</div>
-                  </div>
-                ) : (
-                  transactions.map((tx) => (
-                    <div key={tx.id} className="p-3 bg-gray-50 rounded-lg">
-                      <div className="flex items-center justify-between mb-2">
-                        <div className="flex items-center gap-2">
-                          <div
-                            className={`w-2 h-2 rounded-full ${
-                              tx.status === "success"
-                                ? "bg-green-500"
-                                : tx.status === "pending"
-                                  ? "bg-yellow-500"
-                                  : "bg-red-500"
-                            }`}
-                          ></div>
-                          <span className="font-medium text-sm">{tx.type}</span>
-                        </div>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-6 w-6 p-0"
-                        >
-                          <ExternalLink className="w-3 h-3" />
-                        </Button>
-                      </div>
-                      <div className="text-xs text-gray-600 space-y-1">
-                        <div>
-                          {tx.from} {tx.to && `→ ${tx.to}`}
-                        </div>
-                        <div>Amount: {tx.amount}</div>
-                        <div className="flex items-center justify-between">
-                          <span>{tx.timestamp}</span>
-                          {tx.gasSponsored && (
-                            <Badge
-                              variant="secondary"
-                              className="text-xs bg-green-50 text-green-700"
-                            >
-                              Gas Sponsored
-                            </Badge>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  ))
-                )}
+                <div className="text-center py-8 text-gray-500">
+                  <div className="text-sm">No transactions yet</div>
+                </div>
               </CardContent>
             </Card>
           </div>

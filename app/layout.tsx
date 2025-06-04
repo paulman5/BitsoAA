@@ -17,7 +17,7 @@ export const metadata: Metadata = {
     "A starter kit for building full stack Ethereum dApps with Solidity and Next.js",
 }
 
-const ZERODEV_RPC = process.env.NEXT_PUBLIC_ZERODEV_RPC
+const ZERODEV_RPC = process.env.ZERODEV_RPC
 
 export default function RootLayout({
   children,
